@@ -12,6 +12,8 @@ const Node = union(enum) {
         left: *Node,
         right: *Node,
         len: usize,
+        /// The number of '\n' bytes in the subtree.
+        newlines: usize,
         height: u32,
     };
 
@@ -19,6 +21,14 @@ const Node = union(enum) {
         return switch (node.*) {
             .leaf => |leaf| leaf.items.len,
             .branch => |branch| branch.len,
+        };
+    }
+
+    fn newlines(node: *const Node) usize {
+        return switch (node.*) {
+            // A leaf has at most `max_leaf` bytes, so the count is cheap.
+            .leaf => |leaf| std.mem.countScalar(u8, leaf.items, '\n'),
+            .branch => |branch| branch.newlines,
         };
     }
 
@@ -41,7 +51,7 @@ const Node = union(enum) {
 
     fn createBranch(mem: Mem, left: *Node, right: *Node) Allocator.Error!*Node {
         const node = try mem.nodes.create(mem.gpa);
-        node.* = .{ .branch = .{ .left = left, .right = right, .len = 0, .height = 0 } };
+        node.* = .{ .branch = .{ .left = left, .right = right, .len = 0, .newlines = 0, .height = 0 } };
         node.update();
         return node;
     }
@@ -49,6 +59,7 @@ const Node = union(enum) {
     fn update(node: *Node) void {
         const branch = &node.branch;
         branch.len = branch.left.len() + branch.right.len();
+        branch.newlines = branch.left.newlines() + branch.right.newlines();
         branch.height = 1 + @max(branch.left.height(), branch.right.height());
     }
 
@@ -324,30 +335,39 @@ fn insertInPlace(gpa: Allocator, node: *Node, index: usize, text: []const u8) Al
                 try insertInPlace(gpa, branch.left, index, text)
             else
                 try insertInPlace(gpa, branch.right, index - weight, text);
-            if (done) branch.len += text.len;
+            if (done) {
+                branch.len += text.len;
+                branch.newlines += std.mem.countScalar(u8, text, '\n');
+            }
             return done;
         },
     }
 }
 
-fn deleteInPlace(node: *Node, start: usize, count: usize) bool {
-    if (node.isShared()) return false;
+/// Returns the number of newlines that the deletion removed, or null if it
+/// cannot delete in place.
+fn deleteInPlace(node: *Node, start: usize, count: usize) ?usize {
+    if (node.isShared()) return null;
     switch (node.*) {
         .leaf => |*leaf| {
-            if (count >= leaf.items.len) return false;
+            if (count >= leaf.items.len) return null;
+            const removed = std.mem.countScalar(u8, leaf.items[start..][0..count], '\n');
             leaf.replaceRangeAssumeCapacity(start, count, &.{});
-            return true;
+            return removed;
         },
         .branch => |*branch| {
             const weight = branch.left.len();
-            const done = if (start + count <= weight)
+            const removed = if (start + count <= weight)
                 deleteInPlace(branch.left, start, count)
             else if (start >= weight)
                 deleteInPlace(branch.right, start - weight, count)
             else
-                false;
-            if (done) branch.len -= count;
-            return done;
+                null;
+            if (removed) |n| {
+                branch.len -= count;
+                branch.newlines -= n;
+            }
+            return removed;
         },
     }
 }
@@ -388,6 +408,119 @@ fn writeText(writer: *Io.Writer, root: ?*const Node) Io.Writer.Error!void {
     while (it.next()) |chunk| try writer.writeAll(chunk);
 }
 
+pub const Point = struct { row: usize, column: usize };
+
+/// A changed range. The bytes `start..old_end` of the old text became the
+/// bytes `start..new_end` of the new text.
+pub const Diff = struct { start: usize, old_end: usize, new_end: usize };
+
+/// The number of '\n' bytes before `index`.
+fn newlinesBefore(root: ?*const Node, index: usize) usize {
+    var node = root orelse return 0;
+    var i = index;
+    var count: usize = 0;
+    while (true) {
+        switch (node.*) {
+            .leaf => |leaf| return count + std.mem.countScalar(u8, leaf.items[0..i], '\n'),
+            .branch => |branch| {
+                const weight = branch.left.len();
+                if (i < weight) {
+                    node = branch.left;
+                } else {
+                    i -= weight;
+                    count += branch.left.newlines();
+                    node = branch.right;
+                }
+            },
+        }
+    }
+}
+
+/// The index of the first byte of row `row`: the byte after the row-th
+/// '\n'. Row 0 starts at 0.
+fn lineStart(root: ?*const Node, row: usize) usize {
+    if (row == 0) return 0;
+    var node = root.?;
+    var k = row; // find the k-th newline in this subtree
+    var offset: usize = 0;
+    while (true) {
+        switch (node.*) {
+            .leaf => |leaf| {
+                var seen: usize = 0;
+                for (leaf.items, 0..) |b, i| {
+                    if (b != '\n') continue;
+                    seen += 1;
+                    if (seen == k) return offset + i + 1;
+                }
+                unreachable; // the branch counts said that the newline is here
+            },
+            .branch => |branch| {
+                const left_newlines = branch.left.newlines();
+                if (k <= left_newlines) {
+                    node = branch.left;
+                } else {
+                    k -= left_newlines;
+                    offset += branch.left.len();
+                    node = branch.right;
+                }
+            },
+        }
+    }
+}
+
+/// The length of the common prefix. Two chunks with the same address are
+/// the same leaf, and a snapshot never changes a leaf, so their bytes are
+/// equal.
+fn commonPrefix(a: Snapshot, b: Snapshot) usize {
+    var ia = a.chunks();
+    var ib = b.chunks();
+    var ca = ia.next() orelse return 0;
+    var cb = ib.next() orelse return 0;
+    var n: usize = 0;
+    while (true) {
+        if (ca.ptr == cb.ptr and ca.len == cb.len) {
+            n += ca.len;
+            ca = ia.next() orelse return n;
+            cb = ib.next() orelse return n;
+            continue;
+        }
+        const m = @min(ca.len, cb.len);
+        if (std.mem.indexOfDiff(u8, ca[0..m], cb[0..m])) |i| return n + i;
+        n += m;
+        ca = ca[m..];
+        cb = cb[m..];
+        if (ca.len == 0) ca = ia.next() orelse return n;
+        if (cb.len == 0) cb = ib.next() orelse return n;
+    }
+}
+
+/// The length of the common suffix, at most `limit`.
+fn commonSuffix(a: Snapshot, b: Snapshot, limit: usize) usize {
+    var ia = a.reverseChunks();
+    var ib = b.reverseChunks();
+    var ca = ia.next() orelse return 0;
+    var cb = ib.next() orelse return 0;
+    var n: usize = 0;
+    while (n < limit) {
+        if (ca.ptr == cb.ptr and ca.len == cb.len) {
+            n += ca.len;
+            ca = ia.next() orelse break;
+            cb = ib.next() orelse break;
+            continue;
+        }
+        const m = @min(ca.len, cb.len, limit - n);
+        var i: usize = 0;
+        while (i < m and ca[ca.len - 1 - i] == cb[cb.len - 1 - i]) i += 1;
+        n += i;
+        if (i < m) break;
+        ca = ca[0 .. ca.len - m];
+        cb = cb[0 .. cb.len - m];
+        if (ca.len == 0) ca = ia.next() orelse break;
+        if (cb.len == 0) cb = ib.next() orelse break;
+    }
+    return @min(n, limit);
+}
+
 pub const Snapshot = struct {
     root: ?*Node,
 
@@ -403,6 +536,70 @@ pub const Snapshot = struct {
 
     pub fn chunks(snap: Snapshot) Rope.ChunkIterator {
         return .init(snap.root);
+    }
+
+    /// The chunks from the end to the start.
+    pub fn reverseChunks(snap: Snapshot) Rope.ReverseChunkIterator {
+        return .init(snap.root);
+    }
+
+    /// The number of '\n' bytes.
+    pub fn newlines(snap: Snapshot) usize {
+        const root = snap.root orelse return 0;
+        return root.newlines();
+    }
+
+    /// The bytes from `index` to the end of the chunk that holds `index`.
+    /// It is empty if `index` is the length. It takes O(log n) time.
+    pub fn chunkAt(snap: Snapshot, index: usize) []const u8 {
+        std.debug.assert(index <= snap.len());
+        var node = snap.root orelse return &.{};
+        var i = index;
+        while (true) {
+            switch (node.*) {
+                .leaf => |leaf| return leaf.items[@min(i, leaf.items.len)..],
+                .branch => |branch| {
+                    const weight = branch.left.len();
+                    if (i < weight) {
+                        node = branch.left;
+                    } else {
+                        i -= weight;
+                        node = branch.right;
+                    }
+                },
+            }
+        }
+    }
+
+    /// Copies `out.len` bytes from `start` into `out`.
+    pub fn copyRange(snap: Snapshot, start: usize, out: []u8) void {
+        std.debug.assert(start + out.len <= snap.len());
+        var done: usize = 0;
+        while (done < out.len) {
+            const chunk = snap.chunkAt(start + done);
+            const n = @min(chunk.len, out.len - done);
+            @memcpy(out[done..][0..n], chunk[0..n]);
+            done += n;
+        }
+    }
+
+    /// The row and the byte column of `index`. Rows and columns start at 0.
+    /// It takes O(log n) time.
+    pub fn pointAt(snap: Snapshot, index: usize) Point {
+        std.debug.assert(index <= snap.len());
+        const row = newlinesBefore(snap.root, index);
+        return .{ .row = row, .column = index - lineStart(snap.root, row) };
+    }
+
+    /// The range that changed between two snapshots of the same rope: the
+    /// part between the common prefix and the common suffix. Leaves that
+    /// the two snapshots share are skipped without a byte compare, so an
+    /// edit costs about one pointer compare for each leaf.
+    pub fn diff(old: Snapshot, new: Snapshot) Diff {
+        const start = commonPrefix(old, new);
+        const limit = @min(old.len(), new.len()) - start;
+        const suffix = commonSuffix(old, new, limit);
+        return .{ .start = start, .old_end = old.len() - suffix, .new_end = new.len() - suffix };
     }
 
     pub fn toOwnedSlice(snap: Snapshot, gpa: Allocator) Allocator.Error![]u8 {
@@ -486,6 +683,37 @@ pub const Rope = struct {
         }
     };
 
+    /// As `ChunkIterator`, but from the end to the start.
+    pub const ReverseChunkIterator = struct {
+        stack: [128]*const Node = undefined,
+        depth: usize = 0,
+
+        pub fn next(it: *ReverseChunkIterator) ?[]const u8 {
+            while (it.depth > 0) {
+                it.depth -= 1;
+                const node = it.stack[it.depth];
+                switch (node.*) {
+                    .leaf => |leaf| return leaf.items,
+                    .branch => |branch| {
+                        it.stack[it.depth] = branch.left;
+                        it.stack[it.depth + 1] = branch.right;
+                        it.depth += 2;
+                    },
+                }
+            }
+            return null;
+        }
+
+        fn init(root: ?*const Node) ReverseChunkIterator {
+            var it: ReverseChunkIterator = .{};
+            if (root) |r| {
+                it.stack[0] = r;
+                it.depth = 1;
+            }
+            return it;
+        }
+    };
+
     pub fn chunks(rope: *const Rope) ChunkIterator {
         return .init(rope.root);
     }
@@ -501,6 +729,15 @@ pub const Rope = struct {
     pub fn snapshot(rope: *Rope) Snapshot {
         if (rope.root) |root| _ = root.retain();
         return .{ .root = rope.root };
+    }
+
+    /// One more reference to `snap`. Release it with `release`. As with
+    /// `snapshot` and `release`, only the thread that owns the rope can
+    /// call this.
+    pub fn retain(rope: *Rope, snap: Snapshot) Snapshot {
+        _ = rope;
+        if (snap.root) |root| _ = root.retain();
+        return snap;
     }
 
     pub fn release(rope: *Rope, snap: Snapshot) void {
@@ -541,7 +778,7 @@ pub const Rope = struct {
         std.debug.assert(start + count <= rope.len());
         const mem = rope.memory();
         const root = rope.root.?;
-        if (deleteInPlace(root, start, count)) return;
+        if (deleteInPlace(root, start, count) != null) return;
         rope.root = null;
         const before, const rest = try split(mem, root, start);
         const removed, const after = split(mem, rest.?, count) catch |err| {
@@ -568,6 +805,7 @@ fn checkNode(node: *const Node) !u32 {
             const lh = try checkNode(branch.left);
             const rh = try checkNode(branch.right);
             try std.testing.expectEqual(branch.left.len() + branch.right.len(), branch.len);
+            try std.testing.expectEqual(branch.left.newlines() + branch.right.newlines(), branch.newlines);
             try std.testing.expectEqual(1 + @max(lh, rh), branch.height);
             try std.testing.expect(@max(lh, rh) - @min(lh, rh) <= 1);
             return branch.height;
@@ -1028,4 +1266,125 @@ fn editsWithSnapshots(gpa: Allocator) !void {
 
 test "no leaks when allocation fails with snapshots" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, editsWithSnapshots, .{});
+}
+
+fn naivePoint(text: []const u8, index: usize) Point {
+    const before = text[0..index];
+    const row = std.mem.countScalar(u8, before, '\n');
+    const start = if (std.mem.lastIndexOfScalar(u8, before, '\n')) |i| i + 1 else 0;
+    return .{ .row = row, .column = index - start };
+}
+
+fn naiveDiff(old: []const u8, new: []const u8) Diff {
+    const min = @min(old.len, new.len);
+    const start = std.mem.indexOfDiff(u8, old[0..min], new[0..min]) orelse min;
+    var suffix: usize = 0;
+    while (suffix < min - start and old[old.len - 1 - suffix] == new[new.len - 1 - suffix]) suffix += 1;
+    return .{ .start = start, .old_end = old.len - suffix, .new_end = new.len - suffix };
+}
+
+test "chunkAt, copyRange and pointAt match the text" {
+    const gpa = std.testing.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    for (0..3000) |i| try text.print(gpa, "{d}{s}", .{ i, if (i % 7 == 0) "\n" else " " });
+    var rope = try Rope.fromSlice(gpa, text.items);
+    defer rope.deinit();
+    const snap = rope.snapshot();
+    defer rope.release(snap);
+
+    try std.testing.expectEqual(std.mem.countScalar(u8, text.items, '\n'), snap.newlines());
+    var out: [300]u8 = undefined;
+    var i: usize = 0;
+    while (i <= text.items.len) : (i += 37) {
+        const chunk = snap.chunkAt(i);
+        try std.testing.expectEqualStrings(text.items[i..][0..chunk.len], chunk);
+        if (i < text.items.len) try std.testing.expect(chunk.len > 0);
+        try std.testing.expectEqual(naivePoint(text.items, i), snap.pointAt(i));
+        const n = @min(out.len, text.items.len - i);
+        snap.copyRange(i, out[0..n]);
+        try std.testing.expectEqualStrings(text.items[i..][0..n], out[0..n]);
+    }
+    try std.testing.expectEqual(0, snap.chunkAt(text.items.len).len);
+    try std.testing.expectEqual(naivePoint(text.items, text.items.len), snap.pointAt(text.items.len));
+}
+
+test "reverseChunks gives the chunks in reverse order" {
+    const gpa = std.testing.allocator;
+    const text = try gpa.alloc(u8, 5000);
+    defer gpa.free(text);
+    for (text, 0..) |*c, i| c.* = 'a' + @as(u8, @intCast(i % 26));
+    var rope = try Rope.fromSlice(gpa, text);
+    defer rope.deinit();
+    const snap = rope.snapshot();
+    defer rope.release(snap);
+    var end = text.len;
+    var it = snap.reverseChunks();
+    while (it.next()) |chunk| {
+        try std.testing.expectEqualStrings(text[end - chunk.len .. end], chunk);
+        end -= chunk.len;
+    }
+    try std.testing.expectEqual(0, end);
+}
+
+test "diff of snapshots matches a byte compare after random edits" {
+    const gpa = std.testing.allocator;
+    var prng: std.Random.DefaultPrng = .init(7);
+    const random = prng.random();
+    var big: [20_000]u8 = undefined;
+    for (&big, 0..) |*c, i| c.* = if (i % 41 == 0) '\n' else 'a' + @as(u8, @intCast(i % 3));
+    var rope = try Rope.fromSlice(gpa, &big);
+    defer rope.deinit();
+    const long: [1500]u8 = @splat('x');
+    const pieces = [_][]const u8{ "a", "ab", "\n", "aaa", "b\nc", &long };
+
+    var old = rope.snapshot();
+    defer rope.release(old);
+    var old_text = try rope.toOwnedSlice(gpa);
+    defer gpa.free(old_text);
+    for (0..500) |step| {
+        // One to three edits between two snapshots.
+        for (0..random.intRangeAtMost(usize, 1, 3)) |_| {
+            if (random.boolean() and rope.len() > 10) {
+                const n = random.intRangeAtMost(usize, 1, @min(2000, rope.len() - 1));
+                try rope.delete(random.uintAtMost(usize, rope.len() - n), n);
+            } else {
+                try rope.insert(random.uintAtMost(usize, rope.len()), pieces[random.uintLessThan(usize, pieces.len)]);
+            }
+        }
+        // Sometimes a snapshot that shares nothing, as after a file load.
+        if (step % 100 == 99) {
+            const copy = try rope.toOwnedSlice(gpa);
+            defer gpa.free(copy);
+            var fresh = try Rope.fromSlice(gpa, copy);
+            defer fresh.deinit();
+            const s = fresh.snapshot();
+            defer fresh.release(s);
+            try std.testing.expectEqual(naiveDiff(old_text, copy), Snapshot.diff(old, s));
+        }
+        const new = rope.snapshot();
+        const new_text = try rope.toOwnedSlice(gpa);
+        try std.testing.expectEqual(naiveDiff(old_text, new_text), Snapshot.diff(old, new));
+        // The old snapshot is alive, so check only the tree, not the node count.
+        _ = try checkNode(rope.root.?);
+        rope.release(old);
+        gpa.free(old_text);
+        old = new;
+        old_text = new_text;
+    }
+    // The same snapshot: no change.
+    const d = Snapshot.diff(old, old);
+    try std.testing.expectEqual(d.start, d.old_end);
+    try std.testing.expectEqual(d.start, d.new_end);
+}
+
+test "retain gives one more reference" {
+    var rope = try Rope.fromSlice(std.testing.allocator, "hello");
+    defer rope.deinit();
+    const a = rope.snapshot();
+    const b = rope.retain(a);
+    try rope.insert(0, "x");
+    rope.release(a);
+    try std.testing.expectEqual(5, b.len());
+    rope.release(b);
 }
